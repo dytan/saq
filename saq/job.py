@@ -4,6 +4,7 @@ Jobs
 
 from __future__ import annotations
 
+import os
 import dataclasses
 import enum
 import typing as t
@@ -16,7 +17,9 @@ if t.TYPE_CHECKING:
     from saq.queue import Queue
     from saq.types import DurationKind, Function
 
-ABORT_ID_PREFIX = "saq:abort:"
+APP_NAME = os.environ.get("APP_NAME", "saq")
+
+ABORT_ID_PREFIX = f"{APP_NAME}:saq:abort:"
 
 
 def get_default_job_key() -> str:

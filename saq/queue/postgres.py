@@ -19,7 +19,7 @@ from saq.job import (
     Status,
 )
 from saq.multiplexer import Multiplexer
-from saq.queue.base import Queue, logger
+from saq.queue.base import Queue, logger, APP_PREFIX
 from saq.queue.postgres_migrations import get_migrations
 from saq.utils import now, now_seconds
 
@@ -43,9 +43,9 @@ except ModuleNotFoundError as e:
         "Missing dependencies for Postgres. Install them with `pip install saq[postgres]`."
     ) from e
 
-CHANNEL = "saq:{}"
-ENQUEUE = "saq:enqueue"
-DEQUEUE = "saq:dequeue"
+CHANNEL = f"{APP_PREFIX}:saq:{}"
+ENQUEUE = f"{APP_PREFIX}:saq:enqueue"
+DEQUEUE = f"{APP_PREFIX}:saq:dequeue"
 JOBS_TABLE = "saq_jobs"
 STATS_TABLE = "saq_stats"
 VERSIONS_TABLE = "saq_versions"

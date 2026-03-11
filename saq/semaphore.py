@@ -65,6 +65,7 @@ Usage
 
 from __future__ import annotations
 
+import os
 import asyncio
 import logging
 from contextlib import asynccontextmanager
@@ -77,6 +78,10 @@ if TYPE_CHECKING:
     from saq.types import SemaphoreInfo
 
 logger = logging.getLogger("saq")
+
+
+APP_NAME = os.environ.get("APP_NAME", "saq")
+KEY_PREFIX = f"{APP_NAME}:saq"
 
 # ── Lua scripts ────────────────────────────────────────────────────────────────
 #
@@ -158,7 +163,7 @@ class DistributedSemaphore:
         self.name = name
         self.poll_interval = poll_interval
 
-        self._key: str = f"saq:slots:{name}"
+        self._key: str = f"{KEY_PREFIX}:slots:{name}"
 
         # Register scripts once; Redis caches them by SHA-1 so subsequent
         # calls only transmit the hash, not the full Lua source.

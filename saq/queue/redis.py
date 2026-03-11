@@ -16,7 +16,7 @@ from saq.job import (
     Status,
 )
 from saq.multiplexer import Multiplexer
-from saq.queue.base import Queue, logger
+from saq.queue.base import Queue, logger, APP_PREFIX
 from saq.utils import millis, now, now_seconds
 
 try:
@@ -42,7 +42,7 @@ if t.TYPE_CHECKING:
         WorkerInfo,
     )
 
-ID_PREFIX = "saq:job:"
+ID_PREFIX = f"{APP_PREFIX}:saq:job:"
 
 _PRIORITY_WEIGHT = 1_000_000_000_000_000  # 10^15
 
@@ -353,7 +353,7 @@ class RedisQueue(Queue):
         return job_id[len(f"{ID_PREFIX}{self.name}:"):]
 
     def namespace(self, key: str) -> str:
-        return ":".join(["saq", self.name, key])
+        return ":".join([APP_PREFIX, "saq", self.name, key])
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 

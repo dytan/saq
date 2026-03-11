@@ -38,7 +38,12 @@ import os
 import sys
 from typing import Any
 
+APP_NAME = "test_saq"
+os.environ["APP_NAME"] = APP_NAME
 # ── SAQ public API ─────────────────────────────────────────────────────────────
+import saq
+
+print(saq.__file__)
 from saq import Job, Status, Worker
 from saq.priority import Priority
 from saq.queue.redis import RedisQueue, compute_priority_score, decode_priority_score
@@ -53,7 +58,8 @@ except ImportError as exc:
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-REDIS_URL  = os.getenv("REDIS_URL", "redis://localhost:6379")
+
+REDIS_URL  = os.getenv("REDIS_URL", "redis://10.200.16.74:6379/14")
 QUEUE_NAME = "demo"
 MAX_SLOTS  = int(os.getenv("MAX_SLOTS", "6"))   # global concurrency cap
 
@@ -70,14 +76,14 @@ log = logging.getLogger("example")
 
 async def send_notification(ctx: dict[str, Any], *, user_id: str, message: str) -> dict[str, Any]:
     """Simulate sending a push notification (fast, HIGH priority)."""
-    await asyncio.sleep(0.05)
+    await asyncio.sleep(5)
     log.info("  [notify]  user=%s  msg=%r", user_id, message)
     return {"user_id": user_id, "sent": True}
 
 
 async def generate_report(ctx: dict[str, Any], *, report_id: str) -> dict[str, Any]:
     """Simulate building a report (medium, NORMAL priority)."""
-    await asyncio.sleep(0.4)
+    await asyncio.sleep(4)
     log.info("  [report]  id=%s  rows=2500", report_id)
     return {"report_id": report_id, "rows": 2500}
 
@@ -86,7 +92,7 @@ async def process_batch(
     ctx: dict[str, Any], *, batch_id: str, size: int = 100
 ) -> dict[str, Any]:
     """Simulate background batch processing (slow, LOW priority)."""
-    await asyncio.sleep(size * 0.01)
+    await asyncio.sleep(size * 0.5)
     log.info("  [batch]   id=%s  size=%d", batch_id, size)
     return {"batch_id": batch_id, "processed": size}
 
@@ -123,6 +129,7 @@ async def before_process(ctx: dict[str, Any]) -> None:
 async def after_process(ctx: dict[str, Any]) -> None:
     job: Job | None = ctx.get("job")
     if job:
+        print(job)
         log.debug(
             "after_process   fn=%s  status=%s",
             job.function,
@@ -138,6 +145,7 @@ async def build_queue_and_semaphore() -> tuple[RedisQueue, DistributedSemaphore]
     """Create and return a connected (RedisQueue, DistributedSemaphore) pair."""
     redis     = aioredis.from_url(REDIS_URL, decode_responses=False)
     queue     = RedisQueue(redis, name=QUEUE_NAME)
+    print(queue)
     semaphore = DistributedSemaphore(redis, max_slots=MAX_SLOTS, name=QUEUE_NAME)
     await queue.connect()
     return queue, semaphore
@@ -182,6 +190,14 @@ async def demo_submit() -> None:
     """
     queue, semaphore = await build_queue_and_semaphore()
 
+    # ── NORMAL — standard report ──────────────────────────────────────────────
+    await queue.enqueue(
+        "generate_report",
+        priority = Priority.NORMAL,
+        report_id= "R-001",
+        retries  = 1,
+        timeout  = 30,
+    )
     # ── HIGH — user-facing alert ──────────────────────────────────────────────
     await queue.enqueue(
         "send_notification",
@@ -192,14 +208,7 @@ async def demo_submit() -> None:
         timeout     = 10,
     )
 
-    # ── NORMAL — standard report ──────────────────────────────────────────────
-    await queue.enqueue(
-        "generate_report",
-        priority = Priority.NORMAL,
-        report_id= "R-001",
-        retries  = 1,
-        timeout  = 30,
-    )
+    
 
     # ── NORMAL — will fail → DLQ after retries exhausted ─────────────────────
     await queue.enqueue(

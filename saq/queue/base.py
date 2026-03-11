@@ -4,6 +4,7 @@ Base Queue class
 
 from __future__ import annotations
 
+import os
 import asyncio
 import json
 import logging
@@ -38,6 +39,9 @@ if t.TYPE_CHECKING:
 
 
 logger = logging.getLogger("saq")
+
+
+APP_PREFIX = os.environ.get("APP_NAME", "saq")
 
 
 DEFAULT_SWEPT_JOB_ERROR = "swept"
