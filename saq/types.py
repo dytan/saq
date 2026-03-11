@@ -9,12 +9,22 @@ import typing_extensions as te
 from collections.abc import Collection
 from typing_extensions import Required, TypedDict, Generic
 
+JsonDict = t.Dict[str, t.Any]
+
 if t.TYPE_CHECKING:
     from asyncio import Task
 
     from saq.job import CronJob, Job, Status
+    from saq.semaphore import DistributedSemaphore
     from saq.worker import Worker
     from saq.queue import Queue
+
+# Provide a runtime-safe alias for DistributedSemaphore so that
+# get_type_hints() on SettingsDict can resolve the annotation without
+# triggering circular imports.  Static type-checkers see the real type
+# from the TYPE_CHECKING block above; at runtime this is just Any.
+if not t.TYPE_CHECKING:
+    DistributedSemaphore = t.Any  # type: ignore[assignment,misc]
 
 
 class Context(TypedDict, total=False):
@@ -90,6 +100,21 @@ class WorkerStats(TypedDict):
     "Queue uptime in milliseconds"
 
 
+class SemaphoreInfo(TypedDict):
+    """
+    Distributed Semaphore status snapshot.
+
+    Returned by :meth:`saq.semaphore.DistributedSemaphore.status`.
+    """
+
+    running: int
+    "Number of slots currently acquired (jobs in flight across the fleet)"
+    available: int
+    "Number of slots still free"
+    max: int
+    "Total capacity (max_slots supplied at construction time)"
+
+
 class TimersDict(TypedDict):
     """
     Timers Dictionary
@@ -113,6 +138,35 @@ class PartialTimersDict(TimersDict, total=False):
 
 CtxType = t.TypeVar("CtxType", bound=Context)
 
+# Re-export so callers can import from saq.types without reaching into
+# individual sub-modules.
+__all__ = [
+    "BeforeEnqueueType",
+    "Context",
+    "CountKind",
+    "CtxType",
+    "DumpType",
+    "DurationKind",
+    "Function",
+    "FunctionsType",
+    "JobTaskContext",
+    "JsonDict",
+    "LifecycleFunctionsType",
+    "ListenCallback",
+    "LoadType",
+    "PartialTimersDict",
+    "QueueInfo",
+    "ReceivesContext",
+    "SemaphoreInfo",
+    "SettingsDict",
+    "TimersDict",
+    "VersionTuple",
+    "WorkerInfo",
+    "WorkerStats",
+]
+
+
+
 
 class SettingsDict(TypedDict, Generic[CtxType], total=False):
     """
@@ -129,6 +183,8 @@ class SettingsDict(TypedDict, Generic[CtxType], total=False):
     after_process: ReceivesContext[CtxType]
     timers: PartialTimersDict
     dequeue_timeout: float
+    semaphore: DistributedSemaphore
+    "Optional :class:`~saq.semaphore.DistributedSemaphore` for fleet-wide concurrency control"
 
 
 P = te.ParamSpec("P")

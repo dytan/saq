@@ -37,9 +37,11 @@ if t.TYPE_CHECKING:
     from aiohttp.web_app import Application
 
     from saq.job import CronJob, Job
+    from saq.semaphore import DistributedSemaphore
     from saq.types import (
         Function,
         PartialTimersDict,
+        SemaphoreInfo,
         TimersDict,
         WorkerInfo,
     )
@@ -79,6 +81,18 @@ class Worker(t.Generic[CtxType]):
         metadata: arbitrary data to pass to the worker which it will register with saq
         poll_interval: If > 0.0, dequeue will use polling instead of listen/notify
             to trigger dequeues. This only affects Postgres. (default 0.0)
+        semaphore: optional :class:`~saq.semaphore.DistributedSemaphore` instance.
+            When provided, the worker acquires one slot from the semaphore before
+            starting each job and releases it when the job finishes.  This caps the
+            total number of concurrently running jobs **across the entire fleet**
+            (all worker processes / hosts sharing the same Redis instance), not just
+            within this single process.
+
+            The local ``concurrency`` limit still applies independently — the
+            effective per-worker parallelism is ``min(concurrency, semaphore.max_slots)``.
+
+            If the semaphore is full the worker backs off for ``dequeue_timeout``
+            seconds before retrying, so it never busy-spins.
     """
 
     SIGNALS = [signal.SIGINT, signal.SIGTERM] if os.name != "nt" else []
@@ -104,9 +118,11 @@ class Worker(t.Generic[CtxType]):
         cancellation_hard_deadline_s: float = 1.0,
         metadata: t.Optional[JsonDict] = None,
         poll_interval: float = 0.0,
+        semaphore: DistributedSemaphore | None = None,
     ) -> None:
         self.queue = queue
         self.concurrency = concurrency
+        self.semaphore = semaphore
         self.pool = ThreadPoolExecutor()
         self.startup = ensure_coroutine_function_many(startup, self.pool) if startup else None
         self.shutdown = shutdown
@@ -181,6 +197,15 @@ class Worker(t.Generic[CtxType]):
         """Start processing jobs and upkeep tasks."""
         logger.info("Worker starting: %s", repr(self.queue))
         logger.debug("Registered functions:\n%s", "\n".join(f"  {key}" for key in self.functions))
+
+        if self.semaphore is not None:
+            sem_info = await self.semaphore.status()
+            logger.info(
+                "DistributedSemaphore active — slots %d/%d  key=%s",
+                sem_info["running"],
+                sem_info["max"],
+                self.semaphore._key,
+            )
 
         try:
             self.event = asyncio.Event()
@@ -275,8 +300,15 @@ class Worker(t.Generic[CtxType]):
             logger.info("Scheduled %s", job_ids)
 
     async def worker_info(self, ttl: int = 60) -> WorkerInfo:
+        metadata = dict(self._metadata) if self._metadata else {}
+        if self.semaphore is not None:
+            try:
+                sem_info: SemaphoreInfo = await self.semaphore.status()
+                metadata["semaphore"] = sem_info
+            except Exception:
+                logger.debug("Failed to fetch semaphore status for worker_info", exc_info=True)
         return await self.queue.worker_info(
-            self.id, queue_key=self.queue.name, metadata=self._metadata, ttl=ttl
+            self.id, queue_key=self.queue.name, metadata=metadata or None, ttl=ttl
         )
 
     async def upkeep(self) -> list[Task[None]]:
@@ -341,8 +373,30 @@ class Worker(t.Generic[CtxType]):
     async def process(self) -> bool:
         context: CtxType | None = None
         job: Job | None = None
+        _semaphore_acquired = False
 
         try:
+            # ── Distributed semaphore: acquire a global slot ──────────────────
+            # When a semaphore is configured, attempt a non-blocking acquire
+            # before we even dequeue.  If the fleet is at capacity we back off
+            # for `dequeue_timeout` seconds and return False so the caller
+            # schedules another attempt without holding a slot.
+            if self.semaphore is not None:
+                if not await self.semaphore.try_acquire():
+                    if logger.isEnabledFor(logging.DEBUG):
+                        sem_info = await self.semaphore.status()
+                        logger.debug(
+                            "Semaphore full [%d/%d] — backing off",
+                            sem_info["running"],
+                            sem_info["max"],
+                        )
+                    # Yield for dequeue_timeout seconds so we don't busy-spin,
+                    # then signal the process loop to try again.
+                    if self.dequeue_timeout > 0:
+                        await asyncio.sleep(self.dequeue_timeout)
+                    return False
+                _semaphore_acquired = True
+
             job = await self.queue.dequeue(
                 timeout=self.dequeue_timeout,
                 poll_interval=self._poll_interval,
@@ -420,6 +474,18 @@ class Worker(t.Generic[CtxType]):
                 else:
                     await job.finish(Status.FAILED, error=error)
         finally:
+            # Release the distributed semaphore slot regardless of outcome.
+            # This runs even when the process coroutine is cancelled so the
+            # global counter never permanently leaks.
+            if _semaphore_acquired and self.semaphore is not None:
+                try:
+                    await self.semaphore.release()
+                except Exception:
+                    logger.warning(
+                        "Failed to release semaphore slot — counter may be off by one",
+                        exc_info=True,
+                    )
+
             if context:
                 if job is not None:
                     self.job_task_contexts.pop(job, None)
