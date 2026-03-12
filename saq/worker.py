@@ -201,6 +201,21 @@ class Worker(t.Generic[CtxType]):
         logger.debug("Registered functions:\n%s", "\n".join(f"  {key}" for key in self.functions))
 
         if self.semaphore is not None:
+            # Reconcile the semaphore counter against the actual number of
+            # jobs currently in the active list.  A previous crash may have
+            # left the counter inflated (slots were acquired but never
+            # released because the process died before the finally block ran).
+            actual_active = await self.queue.count("active")
+            current_slots = await self.semaphore.running()
+            if current_slots != actual_active:
+                logger.warning(
+                    "DistributedSemaphore counter mismatch on startup — "
+                    "resetting %d → %d  key=%s",
+                    current_slots,
+                    actual_active,
+                    self.semaphore._key,
+                )
+                await self.semaphore.reset(actual_active)
             sem_info = await self.semaphore.status()
             logger.info(
                 "DistributedSemaphore active — slots %d/%d  key=%s",
@@ -332,7 +347,7 @@ class Worker(t.Generic[CtxType]):
         return [
             asyncio.create_task(poll(self.abort, self.timers["abort"])),
             asyncio.create_task(poll(self.schedule, self.timers["schedule"])),
-            asyncio.create_task(poll(self.queue.sweep, self.timers["sweep"])),
+            asyncio.create_task(poll(self._sweep, self.timers["sweep"])),
             asyncio.create_task(
                 poll(
                     self.worker_info,
@@ -341,6 +356,31 @@ class Worker(t.Generic[CtxType]):
                 )
             ),
         ]
+
+    async def _sweep(self, lock: int = 60) -> list[str]:
+        """Wrapper around ``queue.sweep`` that reconciles the distributed
+        semaphore counter after swept jobs are removed from the active list.
+
+        ``queue.sweep`` calls ``queue.finish`` / ``queue.retry`` directly,
+        bypassing ``worker.process`` and its ``finally`` block.  That means
+        the semaphore is never released for swept jobs, causing the counter
+        to permanently over-count after a crash.  After each sweep we reset
+        the counter to the number of jobs still in the active list, which is
+        the ground-truth for how many slots should be held.
+        """
+        swept = await self.queue.sweep(lock)
+        if swept and self.semaphore is not None:
+            actual_active = await self.queue.count("active")
+            current_slots = await self.semaphore.running()
+            if current_slots != actual_active:
+                logger.warning(
+                    "Post-sweep semaphore reconcile: counter %d → %d  swept=%s",
+                    current_slots,
+                    actual_active,
+                    swept,
+                )
+                await self.semaphore.reset(actual_active)
+        return swept
 
     async def abort(self, abort_threshold: float) -> None:
         def get_duration(job: Job) -> float:
