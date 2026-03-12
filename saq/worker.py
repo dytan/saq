@@ -376,12 +376,20 @@ class Worker(t.Generic[CtxType]):
         _semaphore_acquired = False
 
         try:
-            # ── Distributed semaphore: acquire a global slot ──────────────────
-            # When a semaphore is configured, attempt a non-blocking acquire
-            # before we even dequeue.  If the fleet is at capacity we back off
-            # for `dequeue_timeout` seconds and return False so the caller
-            # schedules another attempt without holding a slot.
+            # ── Distributed semaphore: guard against idle counter inflation ───
+            # Only attempt to acquire a semaphore slot when there is actually
+            # work queued.  This prevents all `concurrency` worker coroutines
+            # from simultaneously holding slots during idle periods (which made
+            # the "running" counter fluctuate even with no jobs submitted).
+            #
+            # Flow:
+            #   1. Cheap ZCARD check — skip entirely if queue is empty.
+            #   2. try_acquire() — back off if fleet is already at capacity.
+            #   3. dequeue() — release immediately if another worker raced us.
             if self.semaphore is not None:
+                if await self.queue.count("queued") == 0:
+                    return False
+
                 if not await self.semaphore.try_acquire():
                     if logger.isEnabledFor(logging.DEBUG):
                         sem_info = await self.semaphore.status()
@@ -403,6 +411,9 @@ class Worker(t.Generic[CtxType]):
             )
 
             if job is None:
+                # Another worker raced us between the queue check and dequeue.
+                # The semaphore slot (if acquired) is released in the finally
+                # block via _semaphore_acquired.
                 return False
 
             job.started = now()
