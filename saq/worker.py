@@ -119,6 +119,7 @@ class Worker(t.Generic[CtxType]):
         metadata: t.Optional[JsonDict] = None,
         poll_interval: float = 0.0,
         semaphore: DistributedSemaphore | None = None,
+        empty_queue_wait_time: float = 1.0,
     ) -> None:
         self.queue = queue
         self.concurrency = concurrency
@@ -149,6 +150,7 @@ class Worker(t.Generic[CtxType]):
         self.tasks: set[Task[t.Any]] = set()
         self.job_task_contexts: dict[Job, JobTaskContext] = {}
         self.dequeue_timeout = dequeue_timeout
+        self.empty_queue_wait_time = empty_queue_wait_time or self.dequeue_timeout or 1.0
         self.burst = burst
         self.max_burst_jobs = max_burst_jobs
         self.burst_jobs_processed = 0
@@ -388,6 +390,7 @@ class Worker(t.Generic[CtxType]):
             #   3. dequeue() — release immediately if another worker raced us.
             if self.semaphore is not None:
                 if await self.queue.count("queued") == 0:
+                    await asyncio.sleep(self.empty_queue_wait_time)
                     return False
 
                 if not await self.semaphore.try_acquire():
