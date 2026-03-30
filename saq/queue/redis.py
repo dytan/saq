@@ -46,6 +46,20 @@ ID_PREFIX = f"{APP_PREFIX}:saq:job:"
 
 _PRIORITY_WEIGHT = 1_000_000_000_000_000  # 10^15
 
+
+def get_queue_redis_namespace(queue_name: str) -> str: 
+    """Return redis key prefix for queue 
+    """
+    return f"{APP_PREFIX}:saq:{queue_name}"
+
+
+def get_queue_redis_pending_key(queue_name: str) -> str: 
+    """Return redis key for the queue pending
+    """
+    return f"{get_queue_redis_namespace(queue_name)}:queued"
+
+
+
 # ── Score helpers ──────────────────────────────────────────────────────────────
 #
 # score = priority × 10^15 − enqueue_time_ms
