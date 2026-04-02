@@ -5,11 +5,13 @@ Redis Queue
 from __future__ import annotations
 
 import asyncio
-import logging
 import json
+import logging
+import os
 import time
 import typing as t
 
+from functools import lru_cache
 from saq.errors import MissingDependencyError
 from saq.job import (
     Job,
@@ -42,21 +44,53 @@ if t.TYPE_CHECKING:
         WorkerInfo,
     )
 
+# Legacy job-id prefix (standalone Redis); :meth:`RedisQueue.job_key_from_id` accepts these too.
 ID_PREFIX = f"{APP_PREFIX}:saq:job:"
 
 _PRIORITY_WEIGHT = 1_000_000_000_000_000  # 10^15
 
 
-def get_queue_redis_namespace(queue_name: str) -> str: 
-    """Return redis key prefix for queue 
-    """
-    return f"{APP_PREFIX}:saq:{queue_name}"
+@lru_cache(maxsize=16)
+def _use_redis_cluster_hash_tags() -> bool:
+    """Match ``REDIS_USE_CLUSTER`` in ``base.lib.utils.task`` (EVAL must use one slot)."""
+    return os.environ.get("REDIS_USE_CLUSTER", "false").lower().strip() in ("true", "1", "yes")
 
 
-def get_queue_redis_pending_key(queue_name: str) -> str: 
-    """Return redis key for the queue pending
-    """
-    return f"{get_queue_redis_namespace(queue_name)}:queued"
+def _saq_queue_key_prefix(queue_name: str) -> str:
+    """Queue-wide Redis key prefix: ``{...}`` tag when cluster, else plain ``APP:saq:name``."""
+    base = f"{APP_PREFIX}:saq:{queue_name}"
+    if _use_redis_cluster_hash_tags():
+        return f"{{{base}}}"
+    return base
+
+
+def get_queue_redis_namespace(queue_name: str) -> str:
+    """Return redis namespace segment for *queue_name* (hash-tagged iff cluster mode)."""
+    return _saq_queue_key_prefix(queue_name)
+
+
+def get_queue_redis_pending_key(queue_name: str) -> str:
+    """Return redis key for the queue pending sorted set."""
+    return f"{_saq_queue_key_prefix(queue_name)}:queued"
+
+
+def get_queue_redis_job_key(queue_name: str, job_key: str) -> str:
+    """Return the Redis string key for one job (member id in the queued ZSET)."""
+    if _use_redis_cluster_hash_tags():
+        return f"{_saq_queue_key_prefix(queue_name)}:job:{job_key}"
+    return f"{ID_PREFIX}{queue_name}:{job_key}"
+
+
+def _async_redis_is_cluster_client(redis: object) -> bool:
+    """True when *redis* is (or wraps) :class:`redis.asyncio.cluster.RedisCluster`."""
+    try:
+        from redis.asyncio.cluster import RedisCluster
+    except ImportError:
+        return False
+    if isinstance(redis, RedisCluster):
+        return True
+    inner = getattr(redis, "_cluster", None)
+    return isinstance(inner, RedisCluster)
 
 
 
@@ -135,10 +169,7 @@ def decode_priority_score(score: float) -> tuple[int, int]:
 #      (used by the scheduler to promote delayed jobs).
 #   4. Persist the serialised job blob under its own key.
 #
-# KEYS[1]  incomplete sorted set   (saq:<name>:incomplete)
-# KEYS[2]  job id string           (saq:job:<name>:<key>)
-# KEYS[3]  priority sorted set     (saq:<name>:queued)   ← was a LIST
-# KEYS[4]  abort sentinel key      (saq:abort:<key>)
+# KEYS[1..4]  When REDIS_USE_CLUSTER=true: {APP:saq:name}:…  Else: APP:saq:name:… / job id prefix.
 # ARGV[1]  serialised job bytes
 # ARGV[2]  scheduled epoch-seconds (0 = enqueue immediately)
 # ARGV[3]  priority score          (composite float as string)
@@ -353,7 +384,12 @@ class RedisQueue(Queue):
         self._dlq        = self.namespace("dlq")         # sorted set — dead-letter queue
 
         self._op_sem = asyncio.Semaphore(max_concurrent_ops)
-        self._pubsub = PubSubMultiplexer(redis.pubsub(), prefix=f"{ID_PREFIX}{self.name}")
+        _ps = (
+            f"{_saq_queue_key_prefix(self.name)}:job:"
+            if _use_redis_cluster_hash_tags()
+            else f"{ID_PREFIX}{self.name}"
+        )
+        self._pubsub = PubSubMultiplexer(redis.pubsub(), prefix=_ps)
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -361,13 +397,27 @@ class RedisQueue(Queue):
         return f"{self.__class__.__name__}<redis={self.redis}, name='{self.name}'>"
 
     def job_id(self, job_key: str) -> str:
+        if _use_redis_cluster_hash_tags():
+            return f"{_saq_queue_key_prefix(self.name)}:job:{job_key}"
         return f"{ID_PREFIX}{self.name}:{job_key}"
 
     def job_key_from_id(self, job_id: str) -> str:
-        return job_id[len(f"{ID_PREFIX}{self.name}:"):]
+        if _use_redis_cluster_hash_tags():
+            tagged = f"{_saq_queue_key_prefix(self.name)}:job:"
+            if job_id.startswith(tagged):
+                return job_id[len(tagged) :]
+        legacy = f"{ID_PREFIX}{self.name}:"
+        if job_id.startswith(legacy):
+            return job_id[len(legacy) :]
+        return job_id
 
     def namespace(self, key: str) -> str:
-        return ":".join([APP_PREFIX, "saq", self.name, key])
+        return f"{_saq_queue_key_prefix(self.name)}:{key}"
+
+    def abort_id_for_key(self, job_key: str) -> str:
+        if _use_redis_cluster_hash_tags():
+            return f"{_saq_queue_key_prefix(self.name)}:abort:{job_key}"
+        return super().abort_id_for_key(job_key)
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -624,25 +674,25 @@ class RedisQueue(Queue):
         """
         Dequeue the highest-priority ready job.
 
-        Uses ``BZPOPMAX`` (blocking pop from sorted set) which requires
-        Redis ≥ 5.0.  Falls back to a non-blocking ``ZPOPMAX`` loop when
-        ``timeout == 0`` and ``poll_interval > 0``.
+        Standalone Redis uses ``BZPOPMAX`` when ``timeout > 0``.  Redis Cluster
+        clients do not reliably support blocking sorted-set pops in redis-py, so
+        we use the atomic Lua script and poll until *timeout* instead.
 
         Args:
             timeout:
-                How long to block waiting for a job, in seconds.
-                ``0`` means return immediately if the queue is empty.
+                How long to wait for a job, in seconds.
+                ``0`` means one non-blocking attempt only.
             poll_interval:
-                When > 0, used as the sleep interval between non-blocking
-                polls instead of a true blocking call.  Only relevant for
-                the Postgres backend; Redis always uses BZPOPMAX.
+                Sleep between Lua dequeue attempts when polling on cluster
+                (default ``0.05`` s if unset).
         """
         if not self._dequeue_script:
             self._dequeue_script = self.redis.register_script(_LUA_DEQUEUE)
 
-        if timeout > 0:
+        cluster = _async_redis_is_cluster_client(self.redis)
+
+        if timeout > 0 and not cluster:
             # Blocking path: BZPOPMAX blocks up to `timeout` seconds.
-            # Returns (key_bytes, member_bytes, score) or None on timeout.
             result = await self.redis.bzpopmax(self._queued, timeout=timeout)
             if result is None:
                 logger.debug("Dequeue timed out")
@@ -653,12 +703,28 @@ class RedisQueue(Queue):
                 if isinstance(job_id_raw, bytes)
                 else job_id_raw
             )
-            # BZPOPMAX already removed the job from the sorted set;
-            # push it onto the active list so sweep can observe it.
             await self.redis.rpush(self._active, job_id)
             return await self._get_job_by_id(job_id)
 
-        # Non-blocking path: atomic Lua ZPOPMAX + RPUSH.
+        if timeout > 0 and cluster:
+            deadline = time.monotonic() + timeout
+            step = poll_interval if poll_interval > 0 else 0.05
+            while time.monotonic() < deadline:
+                job_id_raw = await self._dequeue_script(
+                    keys=[self._queued, self._active],
+                )
+                if job_id_raw:
+                    job_id = (
+                        job_id_raw.decode("utf-8")
+                        if isinstance(job_id_raw, bytes)
+                        else job_id_raw
+                    )
+                    return await self._get_job_by_id(job_id)
+                await asyncio.sleep(step)
+            logger.debug("Dequeue timed out (cluster Lua poll)")
+            return None
+
+        # Non-blocking: single atomic ZPOPMAX + RPUSH.
         job_id_raw = await self._dequeue_script(
             keys=[self._queued, self._active],
         )

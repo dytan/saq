@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 from saq.errors import InvalidUrlError
 from saq.job import (
+    ABORT_ID_PREFIX,
     TERMINAL_STATUSES,
     UNSUCCESSFUL_TERMINAL_STATUSES,
     Job,
@@ -86,6 +87,10 @@ class Queue(ABC):
 
     def job_id(self, job_key: str) -> str:
         return job_key
+
+    def abort_id_for_key(self, job_key: str) -> str:
+        """Abort sentinel key for *job_key* (:class:`RedisQueue` overrides for cluster hash tags)."""
+        return f"{ABORT_ID_PREFIX}{job_key}"
 
     @property
     def swept_error_message(self) -> str:
