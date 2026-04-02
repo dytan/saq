@@ -448,7 +448,12 @@ class RedisQueue(Queue):
         """
         worker_uuids = []
         for key in await self.redis.zrangebyscore(self._stats, now(), "inf"):
-            key_str = key.decode("utf-8")
+            # Redis may return `bytes` (decode_responses=False) or `str`
+            # (decode_responses=True). The monitor UI must handle both.
+            if isinstance(key, bytes):
+                key_str = key.decode("utf-8")
+            else:
+                key_str = str(key)
             *_, worker_uuid = key_str.split(":")
             worker_uuids.append(worker_uuid)
 

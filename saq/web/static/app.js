@@ -276,4 +276,5 @@ const page = async function(path) {
 }
 
 renderPage()
-setInterval(_ => renderPage(), 2000)
+const POLL_INTERVAL_MS = 5000
+setInterval(_ => renderPage(), POLL_INTERVAL_MS)
