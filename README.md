@@ -177,7 +177,64 @@ SAQ is heavily inspired by [ARQ](https://github.com/samuelcolvin/arq) but has se
 5. Before and after job hooks
 6. Easily run multiple workers to leverage more cores
 
+
+---
+
+## Update Summary (base: v0.26.3 → current)
+
+### New Features
+
+#### DistributedSemaphore (`saq/semaphore.py`)
+A Redis-backed global concurrency cap enforced across every worker process and host in the fleet via atomic Lua scripts.
+
+- `try_acquire()` / `acquire()` — non-blocking / blocking slot acquisition
+- `release()` — return a slot (Lua atomically clamps to zero)
+- `reset(value)` — admin recovery from crashed workers
+- `slot()` — async context manager
+- Exposed as `saq.DistributedSemaphore`
+
+#### Priority Queue (`saq/priority.py`, `saq/queue/redis.py`)
+Tri-level job priority implemented as composite Redis sorted-set scores.
+
+- `Priority.HIGH = 3` / `Priority.NORMAL = 2` / `Priority.LOW = 1`
+- Score formula: `priority × 10¹⁵ − enqueue_ms` — different priority tiers never overlap; within a tier, earlier enqueue wins (FIFO)
+- `compute_priority_score(priority, enqueue_ms)` / `decode_priority_score(score)` exposed as `saq.compute_priority_score` / `saq.decode_priority_score`
+- Legacy scheduled jobs (priority=0) use plain timestamp scores for backward compatibility
+
+#### Redis Cluster Support (`saq/queue/redis.py`)
+- `REDIS_USE_CLUSTER=true` env var enables Redis Cluster mode
+- Uses hash-tagged keys (`{app:saq:name}:…`) so multi-key Lua scripts operate on one slot
+- `get_queue_redis_namespace()` / `get_queue_redis_pending_key()` / `get_queue_redis_job_key()` helper functions
+
+#### APP_PREFIX Isolation (`saq/queue/base.py`, `saq/job.py`)
+- `APP_NAME` env var (default `"saq"`) prefixes all Redis keys
+- Affects: `saq:job:`, `saq:abort:`, `saq:slots:` namespaces
+- Allows multiple independent SAQ deployments on the same Redis instance
+
+### Worker Changes (`saq/worker.py`)
+
+- `Worker(semaphore=DistributedSemaphore(...))` — integrates fleet-wide slot control into the job loop
+- `Worker(empty_queue_wait_time=...)` — backoff interval when queue is empty
+- Semaphore counter auto-reconciled on startup against actual active job count
+- `_sweep()` wrapper re-reconciles semaphore after stuck-job cleanup
+- `worker_info()` includes semaphore status in metadata
+- `dequeue_timeout` used as semaphore-backoff duration when fleet is at capacity
+
+### Type Changes (`saq/types.py`)
+
+- `SemaphoreInfo` TypedDict: `running`, `available`, `max`
+- `PartialTimersDict` — all `Worker` timer keys optional
+- `semaphore: DistributedSemaphore` field added to `SettingsDict`
+
+### New Examples
+
+- `examples/priority_semaphore.py` — demo combining `Priority` with `DistributedSemaphore`
+- `examples/monitor_fastapi.py` — FastAPI-based monitoring endpoint
+
+---
+
 ## Development
+
 ```
 python -m venv env
 source env/bin/activate
